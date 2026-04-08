@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoInvest - Dashboard</title>
+    <meta name="description" content="Bot autonomo de inversion en criptomonedas con IA">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-left">
+            <div class="logo">AutoInvest</div>
+            <span id="statusBadge" class="status-badge paper">
+                <span class="status-dot"></span>
+                <span id="statusText">PAPER</span>
+            </span>
+        </div>
+        <div class="header-right">
+            <div class="header-info">
+                <span id="lastUpdate">Cargando...</span>
+                <span id="riskLevel" style="color: var(--yellow)">Riesgo: --</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Ticker Strip -->
+    <div class="ticker-strip" id="tickerStrip">
+        <div class="ticker-item loading" style="height:72px;min-width:160px"></div>
+        <div class="ticker-item loading" style="height:72px;min-width:160px"></div>
+        <div class="ticker-item loading" style="height:72px;min-width:160px"></div>
+        <div class="ticker-item loading" style="height:72px;min-width:160px"></div>
+        <div class="ticker-item loading" style="height:72px;min-width:160px"></div>
+    </div>
+
+    <!-- KPI Cards -->
+    <div class="kpi-row" id="kpiRow">
+        <div class="kpi-card">
+            <div class="kpi-label">Valor Total</div>
+            <div class="kpi-value neutral" id="kpiTotalValue">$10,000.00</div>
+            <div class="kpi-sub" id="kpiMode">Paper Trading</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">PnL Total</div>
+            <div class="kpi-value neutral" id="kpiPnl">$0.00</div>
+            <div class="kpi-sub" id="kpiPnlPct">0.00%</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Cash Disponible</div>
+            <div class="kpi-value neutral" id="kpiCash">$10,000.00</div>
+            <div class="kpi-sub" id="kpiPositions">0 posiciones</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Fear & Greed</div>
+            <div class="kpi-value neutral" id="kpiFearGreed">--</div>
+            <div class="kpi-sub" id="kpiFearGreedLabel">Sin datos</div>
+        </div>
+    </div>
+
+    <!-- Agent + Sentiment Row -->
+    <div class="grid-3-1">
+        <!-- Agent Section -->
+        <div class="card">
+            <div class="card-title"><span class="icon">&#129302;</span> Agente IA - Ultima Decision</div>
+            <div class="agent-outlook" id="agentOutlook">
+                El agente aun no ha tomado decisiones. Esperando datos del mercado...
+            </div>
+            <div id="agentDecisions"></div>
+        </div>
+
+        <!-- Sentiment -->
+        <div class="card">
+            <div class="card-title"><span class="icon">&#128200;</span> Sentimiento</div>
+            <div class="sentiment-gauge">
+                <div class="gauge-value" id="sentimentValue">--</div>
+                <div class="gauge-label" id="sentimentLabel" style="color: var(--text-secondary)">Sin datos</div>
+                <div class="gauge-bar">
+                    <div class="gauge-indicator" id="sentimentIndicator" style="left: 50%"></div>
+                </div>
+                <div class="gauge-labels">
+                    <span>Extreme Fear</span>
+                    <span>Neutral</span>
+                    <span>Extreme Greed</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Technical Analysis + Positions -->
+    <div class="grid-2">
+        <!-- Technical Analysis -->
+        <div class="card">
+            <div class="card-title"><span class="icon">&#128202;</span> Analisis Tecnico</div>
+            <div id="technicalAnalysis">
+                <div class="empty-state">
+                    <div class="icon">&#128202;</div>
+                    <p>Esperando analisis...</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Positions -->
+        <div class="card">
+            <div class="card-title"><span class="icon">&#128188;</span> Posiciones Abiertas</div>
+            <div id="positionsContainer">
+                <div class="empty-state">
+                    <div class="icon">&#128230;</div>
+                    <p>Sin posiciones abiertas</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Trade History -->
+    <div class="card">
+        <div class="card-title"><span class="icon">&#128196;</span> Historial de Trades</div>
+        <div id="tradeHistory">
+            <div class="empty-state">
+                <div class="icon">&#128196;</div>
+                <p>Sin trades registrados</p>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

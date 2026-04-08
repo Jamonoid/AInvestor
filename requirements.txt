@@ -1,0 +1,42 @@
+# AutoInvest - Dependencias
+# Exchange & Market Data
+ccxt>=4.4.0
+requests>=2.31.0
+
+# Data Analysis
+pandas>=2.2.0
+numpy>=1.26.0
+ta>=0.11.0
+
+# AI Agent
+google-genai>=1.0.0
+openai>=1.0.0
+
+# Web Dashboard
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+websockets>=13.0
+
+# Database
+sqlalchemy>=2.0.0
+aiosqlite>=0.20.0
+
+# Scheduler
+apscheduler>=3.10.0
+
+# Sentiment & News
+feedparser>=6.0.0
+newspaper3k>=0.2.8
+vaderSentiment>=3.3.2
+
+# Configuration
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.0
+
+# Logging
+loguru>=0.7.0
+
+# Utilities
+aiohttp>=3.10.0
+python-dateutil>=2.9.0
