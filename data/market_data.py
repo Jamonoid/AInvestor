@@ -53,6 +53,39 @@ class MarketDataCollector:
         self._last_cg_request = 0.0  # rate limit para CoinGecko
 
     # ------------------------------------------------------------------
+    # #5 - Retry con backoff exponencial para CCXT
+    # ------------------------------------------------------------------
+
+    def _ccxt_retry(self, fn, *args, max_retries: int = 3, **kwargs):
+        """
+        Ejecuta una llamada CCXT con retry y backoff exponencial.
+        Atrapa RateLimitExceeded, NetworkError y ExchangeNotAvailable.
+        """
+        for attempt in range(max_retries):
+            try:
+                return fn(*args, **kwargs)
+            except ccxt.RateLimitExceeded as exc:
+                wait = (2 ** attempt) * 2  # 2s, 4s, 8s
+                logger.warning(
+                    f"Rate limit CCXT (intento {attempt + 1}/{max_retries}): {exc}. "
+                    f"Esperando {wait}s..."
+                )
+                time.sleep(wait)
+            except (ccxt.NetworkError, ccxt.ExchangeNotAvailable) as exc:
+                wait = (2 ** attempt) * 3  # 3s, 6s, 12s
+                logger.warning(
+                    f"Error de red CCXT (intento {attempt + 1}/{max_retries}): {exc}. "
+                    f"Reintentando en {wait}s..."
+                )
+                time.sleep(wait)
+            except ccxt.BaseError as exc:
+                logger.error(f"Error CCXT no recuperable: {exc}")
+                return None
+
+        logger.error(f"CCXT agotado tras {max_retries} intentos")
+        return None
+
+    # ------------------------------------------------------------------
     # OHLCV (velas) via CCXT
     # ------------------------------------------------------------------
 
@@ -71,10 +104,8 @@ class MarketDataCollector:
         tf = timeframe or settings.ohlcv_timeframe
         lim = limit or settings.ohlcv_limit
 
-        try:
-            raw = self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=lim)
-        except ccxt.BaseError as exc:
-            logger.error(f"Error OHLCV {symbol}: {exc}")
+        raw = self._ccxt_retry(self.exchange.fetch_ohlcv, symbol, timeframe=tf, limit=lim)
+        if raw is None:
             return pd.DataFrame()
 
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -103,22 +134,21 @@ class MarketDataCollector:
 
     def fetch_ticker(self, symbol: str) -> dict[str, Any]:
         """Obtiene el ticker actual (precio, volumen 24h, cambio %)."""
-        try:
-            ticker = self.exchange.fetch_ticker(symbol)
-            return {
-                "symbol": symbol,
-                "price": ticker.get("last", 0),
-                "bid": ticker.get("bid", 0),
-                "ask": ticker.get("ask", 0),
-                "volume_24h": ticker.get("quoteVolume", 0),
-                "change_24h_pct": ticker.get("percentage", 0),
-                "high_24h": ticker.get("high", 0),
-                "low_24h": ticker.get("low", 0),
-                "timestamp": _dt.datetime.utcnow().isoformat(),
-            }
-        except ccxt.BaseError as exc:
-            logger.error(f"Error ticker {symbol}: {exc}")
+        ticker = self._ccxt_retry(self.exchange.fetch_ticker, symbol)
+        if ticker is None:
             return {}
+
+        return {
+            "symbol": symbol,
+            "price": ticker.get("last", 0),
+            "bid": ticker.get("bid", 0),
+            "ask": ticker.get("ask", 0),
+            "volume_24h": ticker.get("quoteVolume", 0),
+            "change_24h_pct": ticker.get("percentage", 0),
+            "high_24h": ticker.get("high", 0),
+            "low_24h": ticker.get("low", 0),
+            "timestamp": _dt.datetime.utcnow().isoformat(),
+        }
 
     def fetch_all_tickers(self) -> list[dict[str, Any]]:
         """Obtiene tickers de todos los pares configurados."""
@@ -136,18 +166,22 @@ class MarketDataCollector:
 
     def fetch_order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
         """Obtiene el order book (bids y asks)."""
-        try:
-            book = self.exchange.fetch_order_book(symbol, limit=limit)
-            return {
-                "symbol": symbol,
-                "bids": book.get("bids", [])[:10],
-                "asks": book.get("asks", [])[:10],
-                "spread": (book["asks"][0][0] - book["bids"][0][0]) if book.get("asks") and book.get("bids") else 0,
-                "timestamp": _dt.datetime.utcnow().isoformat(),
-            }
-        except (ccxt.BaseError, IndexError) as exc:
-            logger.error(f"Error order book {symbol}: {exc}")
+        book = self._ccxt_retry(self.exchange.fetch_order_book, symbol, limit=limit)
+        if book is None:
             return {}
+
+        try:
+            spread = (book["asks"][0][0] - book["bids"][0][0]) if book.get("asks") and book.get("bids") else 0
+        except (IndexError, KeyError):
+            spread = 0
+
+        return {
+            "symbol": symbol,
+            "bids": book.get("bids", [])[:10],
+            "asks": book.get("asks", [])[:10],
+            "spread": spread,
+            "timestamp": _dt.datetime.utcnow().isoformat(),
+        }
 
     # ------------------------------------------------------------------
     # CoinGecko - Datos complementarios

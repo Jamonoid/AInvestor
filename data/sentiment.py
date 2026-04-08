@@ -147,8 +147,8 @@ class SentimentCollector:
         Genera un score consolidado de sentimiento del mercado.
 
         Combina:
-        - Fear & Greed Index (40% peso)
-        - Sentimiento de noticias (60% peso)
+        - Fear & Greed Index (60% peso) - mas confiable que NLP basico
+        - Sentimiento de noticias (40% peso) - con decaimiento temporal
 
         Returns:
             {
@@ -165,15 +165,24 @@ class SentimentCollector:
         # Normalizar a -1 ... +1 (0=extreme fear, 100=extreme greed)
         fng_normalized = (fng["current_value"] - 50) / 50
 
-        # Noticias
+        # Noticias con decaimiento temporal (#9)
         news = self.fetch_news()
         if news:
-            avg_sentiment = sum(n["sentiment_score"] for n in news) / len(news)
+            weighted_sentiment = 0.0
+            total_weight = 0.0
+
+            for n in news:
+                # Calcular peso temporal: noticias viejas pesan menos
+                weight = self._calculate_time_weight(n.get("published", ""))
+                weighted_sentiment += n["sentiment_score"] * weight
+                total_weight += weight
+
+            avg_sentiment = weighted_sentiment / total_weight if total_weight > 0 else 0.0
         else:
             avg_sentiment = 0.0
 
-        # Score consolidado (40% FnG + 60% noticias)
-        overall = fng_normalized * 0.4 + avg_sentiment * 0.6
+        # #9 - Score consolidado (60% FnG + 40% noticias)
+        overall = fng_normalized * 0.6 + avg_sentiment * 0.4
 
         # Label
         if overall > 0.5:
@@ -209,3 +218,30 @@ class SentimentCollector:
 
         logger.info(f"Sentimiento del mercado: {overall:.3f} ({label})")
         return result
+
+    @staticmethod
+    def _calculate_time_weight(published_str: str) -> float:
+        """
+        Calcula un peso temporal para una noticia.
+        Noticias recientes (<2h) pesan 1.0, de 2-4h pesan 0.75,
+        de 4-8h pesan 0.5, mas de 8h pesan 0.25.
+        """
+        if not published_str:
+            return 0.5  # peso neutral si no hay fecha
+
+        try:
+            from email.utils import parsedate_to_datetime
+            pub_dt = parsedate_to_datetime(published_str)
+            age_hours = (_dt.datetime.now(pub_dt.tzinfo) - pub_dt).total_seconds() / 3600
+        except Exception:
+            return 0.5
+
+        if age_hours < 2:
+            return 1.0
+        elif age_hours < 4:
+            return 0.75
+        elif age_hours < 8:
+            return 0.5
+        else:
+            return 0.25
+

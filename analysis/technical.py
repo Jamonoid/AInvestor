@@ -70,6 +70,15 @@ class TechnicalAnalyzer:
             logger.warning(f"Datos insuficientes para analisis tecnico de {symbol}: {len(df)} velas")
             return TechnicalSummary(symbol=symbol)
 
+        # #4 - Descartar la ultima vela (probablemente no cerrada aun).
+        # Indicadores como MACD, EMA y RSI dan senales falsas con velas incompletas
+        # porque el "close" fluctua con el precio actual, no es el cierre real.
+        df = df.iloc[:-1].copy()
+
+        if len(df) < 50:
+            logger.warning(f"Datos insuficientes tras descartar vela abierta de {symbol}")
+            return TechnicalSummary(symbol=symbol)
+
         summary = TechnicalSummary(symbol=symbol)
 
         # Calcular cada indicador
@@ -102,17 +111,29 @@ class TechnicalAnalyzer:
         if total_weight > 0:
             summary.overall_score = weighted_sum / total_weight
 
-        # Determinar senal
-        if summary.overall_score > 0.25:
+        # #11 - Umbral adaptativo basado en ATR
+        # ATR alto = mercado volatil = necesita senal mas fuerte
+        # ATR bajo = mercado tranquilo = senal mas debil es significativa
+        atr_value = 2.0  # default
+        for sig in summary.signals:
+            if sig.name == "ATR":
+                atr_value = sig.value
+                break
+
+        # Base: 0.25. Escala con ATR: bajo(<1.5%) -> 0.18, normal(2-3%) -> 0.25, alto(>5%) -> 0.35
+        threshold = min(max(0.15 + atr_value * 0.02, 0.15), 0.40)
+
+        # Determinar senal con umbral adaptativo
+        if summary.overall_score > threshold:
             summary.overall_signal = "buy"
-        elif summary.overall_score < -0.25:
+        elif summary.overall_score < -threshold:
             summary.overall_signal = "sell"
         else:
             summary.overall_signal = "neutral"
 
         logger.info(
             f"TA {symbol}: {summary.overall_signal.upper()} "
-            f"(score: {summary.overall_score:.3f})"
+            f"(score: {summary.overall_score:.3f}, umbral: {threshold:.3f})"
         )
         return summary
 

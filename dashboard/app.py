@@ -6,8 +6,10 @@ API REST + WebSocket para monitoreo en tiempo real.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as _dt
 import json
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -40,15 +42,20 @@ _state: dict[str, Any] = {
     "risk_level": "UNKNOWN",
 }
 
+# #2 - Lock para proteger _state de escrituras concurrentes (APScheduler threads + FastAPI async)
+_state_lock = threading.Lock()
+
 
 def update_dashboard_state(key: str, value: Any) -> None:
-    """Actualiza el estado del dashboard (llamado desde main.py)."""
-    _state[key] = value
-    _state["last_update"] = _dt.datetime.utcnow().isoformat()
+    """Actualiza el estado del dashboard (llamado desde main.py en threads del scheduler)."""
+    with _state_lock:
+        _state[key] = value
+        _state["last_update"] = _dt.datetime.utcnow().isoformat()
 
 
 def get_dashboard_state() -> dict[str, Any]:
-    return _state.copy()
+    with _state_lock:
+        return copy.deepcopy(_state)
 
 
 # ---------------------------------------------------------------------------
@@ -58,24 +65,33 @@ def get_dashboard_state() -> dict[str, Any]:
 class ConnectionManager:
     def __init__(self) -> None:
         self.active: list[WebSocket] = []
+        self._lock = asyncio.Lock()
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
-        self.active.append(ws)
+        async with self._lock:
+            self.active.append(ws)
 
-    def disconnect(self, ws: WebSocket) -> None:
-        if ws in self.active:
-            self.active.remove(ws)
+    async def disconnect(self, ws: WebSocket) -> None:
+        async with self._lock:
+            if ws in self.active:
+                self.active.remove(ws)
 
     async def broadcast(self, data: dict) -> None:
+        # #2 - Iterar sobre copia para evitar RuntimeError si la lista cambia
+        async with self._lock:
+            snapshot = self.active.copy()
         dead = []
-        for ws in self.active:
+        for ws in snapshot:
             try:
                 await ws.send_json(data)
             except Exception:
                 dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws)
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    if ws in self.active:
+                        self.active.remove(ws)
 
 
 ws_manager = ConnectionManager()
@@ -219,20 +235,22 @@ async def websocket_endpoint(ws: WebSocket):
     await ws_manager.connect(ws)
     try:
         while True:
-            # Enviar estado actual cada 5 segundos
-            await ws.send_json({
-                "type": "state_update",
-                "data": {
-                    "portfolio": _state.get("portfolio", {}),
-                    "tickers": _state.get("tickers", []),
+            # #2 - Leer _state de forma thread-safe
+            with _state_lock:
+                state_snapshot = {
+                    "portfolio": copy.deepcopy(_state.get("portfolio", {})),
+                    "tickers": copy.deepcopy(_state.get("tickers", [])),
                     "bot_running": _state["bot_running"],
                     "last_update": _state["last_update"],
                     "risk_level": _state.get("risk_level", "UNKNOWN"),
-                },
+                }
+            await ws.send_json({
+                "type": "state_update",
+                "data": state_snapshot,
             })
             await asyncio.sleep(5)
     except WebSocketDisconnect:
-        ws_manager.disconnect(ws)
+        await ws_manager.disconnect(ws)
 
 
 # ---------------------------------------------------------------------------

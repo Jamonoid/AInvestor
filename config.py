@@ -74,10 +74,28 @@ class Settings(BaseSettings):
     # --- Riesgo ---
     max_position_percent: float = 5.0    # Maximo % del portfolio por posicion
     stop_loss_percent: float = 3.0       # Stop-loss por defecto (%)
-    take_profit_percent: float = 5.0     # Take-profit por defecto (%)
+    take_profit_percent: float = 8.0     # Take-profit por defecto (%)
     max_daily_trades: int = 10           # Maximo de trades por dia
     max_drawdown_percent: float = 15.0   # Maximo drawdown antes de pausar (%)
     trade_cooldown_minutes: int = 30     # Cooldown entre trades del mismo par
+
+    # --- Trailing Stop ---
+    trailing_stop_enabled: bool = True   # Activar trailing stop-loss
+    trailing_stop_percent: float = 2.0   # Trailing % desde el maximo alcanzado
+
+    # --- Simulacion (paper trading) ---
+    simulated_slippage_percent: float = 0.1  # Slippage simulado (%)
+    simulated_fees_percent: float = 0.1      # Fees simulados (%)
+
+    # --- Take-Profit parcial ---
+    take_profit_partial_percent: float = 50.0  # % de la posicion a cerrar en primer TP
+
+    # --- Confianza flexible ---
+    min_confidence_small: float = 50.0   # Confianza minima para trades chicos (max 2%)
+    min_confidence_normal: float = 60.0  # Confianza minima para trades normales
+
+    # --- Liquidez ---
+    min_liquidity_ratio: float = 10.0    # Volumen 24h debe ser N veces la orden
 
     # --- OHLCV ---
     ohlcv_timeframe: str = "1h"          # Timeframe para velas (1m, 5m, 15m, 1h, 4h, 1d)
@@ -95,8 +113,13 @@ class Settings(BaseSettings):
     def db_url(self) -> str:
         return f"sqlite:///{DB_DIR / 'autoinvest.db'}"
 
-    # --- Gemini model ---
-    gemini_model: str = "gemini-2.5-flash"
+    # --- LLM ---
+    openrouter_model: str = "moonshotai/kimi-k2"  # Modelo OpenRouter (principal)
+    gemini_model: str = "gemini-2.5-flash"         # Modelo Gemini (fallback)
+    llm_temperature: float = 0.3       # Creatividad (0=determinista, 1=creativo). Bajo para trading.
+    llm_top_p: float = 0.9             # Nucleus sampling. 0.9 = considera top 90% de tokens.
+    llm_top_k: int = 40                # Top-K sampling. 40 = considera los 40 tokens mas probables.
+    llm_max_tokens: int = 4096         # Max tokens de respuesta
 
 
 # Singleton de configuracion

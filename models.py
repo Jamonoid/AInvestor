@@ -103,15 +103,31 @@ class MarketDataCache(Base):
 # Engine y Session Factory
 # ---------------------------------------------------------------------------
 
-engine = create_engine(settings.db_url, echo=False)
+# #1 - SQLite concurrencia:
+# - check_same_thread=False: permite acceso desde multiples hilos (APScheduler + FastAPI)
+# - timeout=15: espera hasta 15s si la DB esta bloqueada en vez de fallar inmediatamente
+engine = create_engine(
+    settings.db_url,
+    echo=False,
+    connect_args={"check_same_thread": False, "timeout": 15},
+)
 SessionLocal = sessionmaker(bind=engine, class_=Session)
 
 
 def init_db() -> None:
-    """Crea todas las tablas si no existen."""
+    """Crea todas las tablas si no existen. Activa WAL mode para concurrencia."""
     Base.metadata.create_all(engine)
+
+    # Activar WAL (Write-Ahead Logging) para permitir lectores concurrentes
+    # mientras alguien escribe. Crucial para APScheduler + FastAPI simultaneos.
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        conn.execute(text("PRAGMA journal_mode=WAL"))
+        conn.execute(text("PRAGMA busy_timeout=15000"))
+        conn.commit()
 
 
 def get_session() -> Session:
     """Retorna una nueva sesion de base de datos."""
     return SessionLocal()
+

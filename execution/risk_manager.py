@@ -37,6 +37,7 @@ class RiskAssessment:
     adjusted_cost: float = 0.0    # costo ajustado por riesgo
     suggested_stop_loss: float = 0.0
     suggested_take_profit: float = 0.0
+    suggested_fees: float = 0.0   # fees estimados para esta operacion
     reason: str = ""
 
 
@@ -50,11 +51,15 @@ class RiskManager:
     3. Maximo trades por dia
     4. Maximo drawdown antes de pausar
     5. Cooldown entre trades del mismo par
+    6. Verificacion de liquidez (#10)
+    7. Position sizing basado en ATR (#8)
+    8. Flash crash protection (#5)
     """
 
     def __init__(self) -> None:
         self._paused = False
         self._pause_reason = ""
+        self._last_known_prices: dict[str, float] = {}  # #5 - para detectar flash crashes
 
     @property
     def is_paused(self) -> bool:
@@ -90,6 +95,7 @@ class RiskManager:
         cash_available: float,
         positions: dict[str, Any],  # posiciones abiertas
         atr_percent: float = 2.0,   # ATR % para calibrar stop-loss
+        volume_24h: float = 0.0,    # #10 - volumen 24h del par
     ) -> RiskAssessment:
         """
         Evalua una operacion propuesta contra todas las reglas de riesgo.
@@ -101,6 +107,14 @@ class RiskManager:
 
         # 0. ¿Esta pausado?
         if self._paused:
+            # #6 - Drawdown pausa solo compras, ventas siempre permitidas
+            if side == "sell":
+                return RiskAssessment(
+                    approved=True,
+                    checks=[RiskCheck(True, "SELL_WHILE_PAUSED", "Ventas permitidas durante pausa")],
+                    adjusted_cost=proposed_cost,
+                    reason="Venta aprobada (pausa solo afecta compras)",
+                )
             return RiskAssessment(
                 approved=False,
                 checks=[RiskCheck(False, "PAUSED", f"Trading pausado: {self._pause_reason}")],
@@ -137,14 +151,18 @@ class RiskManager:
                 message=f"Posicion OK: ${proposed_cost:.2f} / ${max_cost:.2f} max",
             ))
 
-        # 2. ¿Hay suficiente cash?
-        if adjusted_cost > cash_available:
-            adjusted_cost = cash_available * 0.95  # dejar 5% de margen
+        # 2. ¿Hay suficiente cash? (ahora con fees incluidos)
+        estimated_fees = adjusted_cost * (settings.simulated_fees_percent / 100)
+        total_needed = adjusted_cost + estimated_fees
+
+        if total_needed > cash_available:
+            adjusted_cost = (cash_available * 0.95) / (1 + settings.simulated_fees_percent / 100)
+            estimated_fees = adjusted_cost * (settings.simulated_fees_percent / 100)
             if adjusted_cost < 10:  # minimo $10 para que valga la pena
                 checks.append(RiskCheck(
                     passed=False,
                     rule="INSUFFICIENT_CASH",
-                    message=f"Cash insuficiente: ${cash_available:.2f} disponible",
+                    message=f"Cash insuficiente: ${cash_available:.2f} disponible (necesita ${total_needed:.2f} con fees)",
                 ))
                 return RiskAssessment(
                     approved=False,
@@ -154,7 +172,7 @@ class RiskManager:
             checks.append(RiskCheck(
                 passed=True,
                 rule="CASH_ADJUSTED",
-                message=f"Ajustado al cash disponible: ${adjusted_cost:.2f}",
+                message=f"Ajustado al cash disponible: ${adjusted_cost:.2f} + ${estimated_fees:.2f} fees",
                 original_amount=proposed_cost,
                 adjusted_amount=adjusted_cost,
             ))
@@ -190,7 +208,42 @@ class RiskManager:
                 reason=dd_check.message,
             )
 
-        # 6. Calcular stop-loss y take-profit sugeridos
+        # 6. (#10) Verificacion de liquidez
+        if volume_24h > 0:
+            liquidity_check = self._check_liquidity(symbol, adjusted_cost, volume_24h)
+            checks.append(liquidity_check)
+            if not liquidity_check.passed:
+                return RiskAssessment(
+                    approved=False,
+                    checks=checks,
+                    reason=liquidity_check.message,
+                )
+
+        # 7. (#8) Position sizing basado en ATR - ajustar tamano por volatilidad
+        atr_sized_cost = self._calculate_atr_position_size(
+            current_price=current_price,
+            atr_percent=atr_percent,
+            portfolio_value=portfolio_value,
+        )
+        if atr_sized_cost < adjusted_cost:
+            checks.append(RiskCheck(
+                passed=True,
+                rule="ATR_SIZING",
+                message=f"Posicion reducida por volatilidad: ${adjusted_cost:.2f} -> ${atr_sized_cost:.2f} "
+                        f"(ATR: {atr_percent:.2f}%)",
+                original_amount=adjusted_cost,
+                adjusted_amount=atr_sized_cost,
+            ))
+            adjusted_cost = atr_sized_cost
+            estimated_fees = adjusted_cost * (settings.simulated_fees_percent / 100)
+        else:
+            checks.append(RiskCheck(
+                passed=True,
+                rule="ATR_SIZING",
+                message=f"Tamano de posicion OK para volatilidad ATR={atr_percent:.2f}%",
+            ))
+
+        # 8. Calcular stop-loss y take-profit sugeridos
         sl_pct = max(settings.stop_loss_percent, atr_percent * 1.5)
         tp_pct = settings.take_profit_percent
 
@@ -205,6 +258,7 @@ class RiskManager:
             adjusted_cost=adjusted_cost,
             suggested_stop_loss=stop_loss,
             suggested_take_profit=take_profit,
+            suggested_fees=estimated_fees,
             reason="Aprobado" if all_passed else "Rechazado por riesgo",
         )
 
@@ -293,6 +347,62 @@ class RiskManager:
         finally:
             session.close()
 
+    def _check_liquidity(self, symbol: str, order_cost: float, volume_24h: float) -> RiskCheck:
+        """#10 - Verifica que haya suficiente liquidez para la orden."""
+        if volume_24h <= 0:
+            return RiskCheck(True, "LIQUIDITY", "Sin datos de volumen, continuando")
+
+        ratio = volume_24h / order_cost if order_cost > 0 else float("inf")
+
+        if ratio < settings.min_liquidity_ratio:
+            return RiskCheck(
+                passed=False,
+                rule="LIQUIDITY",
+                message=f"Liquidez insuficiente para {symbol}: orden ${order_cost:.2f} vs volumen 24h ${volume_24h:.0f} "
+                        f"(ratio: {ratio:.1f}x, minimo: {settings.min_liquidity_ratio}x)",
+            )
+        return RiskCheck(
+            passed=True,
+            rule="LIQUIDITY",
+            message=f"Liquidez OK para {symbol}: ratio {ratio:.0f}x (minimo: {settings.min_liquidity_ratio}x)",
+        )
+
+    # ------------------------------------------------------------------
+    # #8 - Position sizing basado en ATR
+    # ------------------------------------------------------------------
+
+    def _calculate_atr_position_size(
+        self,
+        current_price: float,
+        atr_percent: float,
+        portfolio_value: float,
+        risk_per_trade_pct: float = 1.0,  # arriesgar max 1% del portfolio por trade
+    ) -> float:
+        """
+        Calcula el tamano de posicion basado en riesgo fijo en dolares.
+
+        Logica: si ATR es alto, la posicion debe ser mas chica para mantener
+        el riesgo en dolares constante.
+
+        Retorna el costo maximo recomendado en USDT.
+        """
+        if atr_percent <= 0 or current_price <= 0:
+            return portfolio_value * (settings.max_position_percent / 100)
+
+        # Riesgo maximo en dolares = 1% del portfolio
+        risk_dollars = portfolio_value * (risk_per_trade_pct / 100)
+
+        # Distancia al SL en %
+        sl_distance_pct = max(settings.stop_loss_percent, atr_percent * 1.5)
+
+        # Tamano de posicion = riesgo / distancia al SL
+        position_size_usd = risk_dollars / (sl_distance_pct / 100)
+
+        # No exceder el maximo por posicion
+        max_position = portfolio_value * (settings.max_position_percent / 100)
+
+        return min(position_size_usd, max_position)
+
     # ------------------------------------------------------------------
     # Stop-loss checker (se llama frecuentemente)
     # ------------------------------------------------------------------
@@ -303,10 +413,11 @@ class RiskManager:
         current_prices: dict[str, float],
     ) -> list[dict[str, Any]]:
         """
-        Revisa todas las posiciones abiertas contra sus stop-loss.
+        Revisa todas las posiciones abiertas contra sus stop-loss y take-profit.
+        Incluye deteccion de flash crash (#5) y take-profit parcial (#4).
 
         Returns:
-            Lista de posiciones que deben cerrarse.
+            Lista de posiciones que deben cerrarse (total o parcialmente).
         """
         to_close: list[dict[str, Any]] = []
 
@@ -324,6 +435,27 @@ class RiskManager:
 
             pnl_pct = ((price - entry_price) / entry_price) * 100
 
+            # #5 - Flash crash detection: caida brusca desde ultimo precio conocido
+            last_known = self._last_known_prices.get(symbol, price)
+            if last_known > 0:
+                price_change_pct = ((price - last_known) / last_known) * 100
+                if price_change_pct < -10:  # caida de mas del 10% en un solo check
+                    logger.warning(
+                        f"FLASH CRASH detectado en {symbol}: {price_change_pct:.1f}% "
+                        f"(${last_known:.2f} -> ${price:.2f})"
+                    )
+                    to_close.append({
+                        "symbol": symbol,
+                        "reason": "flash_crash",
+                        "price": price,
+                        "pnl_pct": pnl_pct,
+                        "close_percent": 100.0,
+                    })
+                    self._last_known_prices[symbol] = price
+                    continue
+
+            self._last_known_prices[symbol] = price
+
             # Stop-loss
             if stop_loss > 0 and price <= stop_loss:
                 logger.warning(
@@ -335,19 +467,39 @@ class RiskManager:
                     "reason": "stop_loss",
                     "price": price,
                     "pnl_pct": pnl_pct,
+                    "close_percent": 100.0,
                 })
 
-            # Take-profit
+            # Take-profit parcial (#4)
             elif take_profit > 0 and price >= take_profit:
-                logger.info(
-                    f"TAKE-PROFIT {symbol}: precio ${price:.2f} >= TP ${take_profit:.2f} "
-                    f"(PnL: {pnl_pct:.2f}%)"
-                )
-                to_close.append({
-                    "symbol": symbol,
-                    "reason": "take_profit",
-                    "price": price,
-                    "pnl_pct": pnl_pct,
-                })
+                partial_pct = settings.take_profit_partial_percent
+                already_partial = pos.get("_tp_partial_done", False)
+
+                if not already_partial and partial_pct < 100:
+                    # Primera vez que toca TP: cerrar parcial
+                    logger.info(
+                        f"TAKE-PROFIT PARCIAL {symbol}: precio ${price:.2f} >= TP ${take_profit:.2f} "
+                        f"(cerrando {partial_pct}%, PnL: {pnl_pct:.2f}%)"
+                    )
+                    to_close.append({
+                        "symbol": symbol,
+                        "reason": "take_profit_partial",
+                        "price": price,
+                        "pnl_pct": pnl_pct,
+                        "close_percent": partial_pct,
+                    })
+                else:
+                    # Ya se hizo parcial o el partial es 100%: cierre total
+                    logger.info(
+                        f"TAKE-PROFIT {symbol}: precio ${price:.2f} >= TP ${take_profit:.2f} "
+                        f"(PnL: {pnl_pct:.2f}%)"
+                    )
+                    to_close.append({
+                        "symbol": symbol,
+                        "reason": "take_profit",
+                        "price": price,
+                        "pnl_pct": pnl_pct,
+                        "close_percent": 100.0,
+                    })
 
         return to_close

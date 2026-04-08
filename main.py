@@ -71,6 +71,7 @@ class AutoInvestBot:
         self._ta_cache: dict[str, Any] = {}
         self._sentiment_cache: dict[str, Any] = {}
         self._current_prices: dict[str, float] = {}
+        self._volumes_24h: dict[str, float] = {}  # #10 - cache de volumenes para liquidez
 
         # Control
         self._running = True
@@ -81,6 +82,10 @@ class AutoInvestBot:
         self._sync_dashboard = update_dashboard_state
 
         logger.info("Todos los componentes inicializados correctamente")
+
+        # #12 - Reportar posiciones restauradas
+        if self.portfolio.positions:
+            logger.info(f"Portfolio restaurado con {len(self.portfolio.positions)} posiciones abiertas")
 
     # ------------------------------------------------------------------
     # Tareas del scheduler
@@ -97,10 +102,12 @@ class AutoInvestBot:
             # Tickers
             self._tickers_cache = self.market_data.fetch_all_tickers()
 
-            # Actualizar precios actuales
+            # Actualizar precios actuales y volumenes
             for t in self._tickers_cache:
                 if t.get("symbol") and t.get("price"):
                     self._current_prices[t["symbol"]] = t["price"]
+                if t.get("symbol") and t.get("volume_24h"):
+                    self._volumes_24h[t["symbol"]] = t["volume_24h"]
 
             # Sync dashboard
             self._sync_dashboard("tickers", self._tickers_cache)
@@ -142,8 +149,8 @@ class AutoInvestBot:
             self._sync_dashboard("technical_analysis", self._ta_cache)
 
             for sym, s in results.items():
-                emoji = "🟢" if s.overall_signal == "buy" else "🔴" if s.overall_signal == "sell" else "⚪"
-                logger.info(f"  {emoji} {sym}: {s.overall_signal.upper()} (score: {s.overall_score:.3f})")
+                signal_icon = "[BUY]" if s.overall_signal == "buy" else "[SELL]" if s.overall_signal == "sell" else "[---]"
+                logger.info(f"  {signal_icon} {sym}: {s.overall_signal.upper()} (score: {s.overall_score:.3f})")
 
         except Exception as exc:
             logger.error(f"Error en analisis tecnico: {exc}")
@@ -212,10 +219,13 @@ class AutoInvestBot:
             logger.error(f"Error en decision del agente: {exc}")
 
     def task_check_stop_losses(self) -> None:
-        """Tarea: Verificar stop-loss y take-profit (cada 1 min)."""
+        """Tarea: Verificar stop-loss, take-profit, trailing y flash crash (cada intervalo)."""
         try:
             if not self._current_prices or not self.portfolio.positions:
                 return
+
+            # #3 - Actualizar trailing stops ANTES de chequear
+            self.portfolio.update_trailing_stops(self._current_prices)
 
             to_close = self.risk_manager.check_stop_losses(
                 positions=self.portfolio.positions,
@@ -226,9 +236,33 @@ class AutoInvestBot:
                 symbol = item["symbol"]
                 price = item["price"]
                 reason = item["reason"]
+                close_percent = item.get("close_percent", 100.0)
                 pos = self.portfolio.get_position(symbol)
 
-                if pos:
+                if not pos:
+                    continue
+
+                if close_percent < 100.0:
+                    # Cierre parcial (#4 - take-profit parcial)
+                    close_amount = pos["amount"] * (close_percent / 100.0)
+                    logger.info(f"Cerrando {close_percent:.0f}% de {symbol} por {reason} @ ${price:.2f}")
+
+                    trade = self.order_manager.execute_sell(
+                        symbol=symbol,
+                        amount=close_amount,
+                        current_price=price,
+                        entry_price=pos["entry_price"],
+                        reason=f"Auto {reason}: PnL {item['pnl_pct']:.2f}%",
+                    )
+                    if trade:
+                        self.portfolio.close_position(symbol, price, partial_percent=close_percent)
+                        # Marcar que ya se hizo cierre parcial
+                        remaining = self.portfolio.get_position(symbol)
+                        if remaining:
+                            self.portfolio._positions[symbol]["_tp_partial_done"] = True
+                            self.portfolio._save_state()
+                else:
+                    # Cierre total
                     logger.warning(f"Cerrando {symbol} por {reason} @ ${price:.2f}")
                     trade = self.order_manager.execute_sell(
                         symbol=symbol,
@@ -258,9 +292,9 @@ class AutoInvestBot:
             logger.info(f"  Posiciones abiertas: {pnl['num_positions']}")
 
             for sym, p in pnl.get("positions", {}).items():
-                emoji = "✅" if p["unrealized_pnl"] >= 0 else "❌"
+                status = "GANANDO" if p["unrealized_pnl"] >= 0 else "PERDIENDO"
                 logger.info(
-                    f"    {emoji} {sym}: ${p['value']:.2f} "
+                    f"    [{status}] {sym}: ${p['value']:.2f} "
                     f"(PnL: {p['unrealized_pnl_pct']:+.2f}%)"
                 )
 
@@ -292,16 +326,21 @@ class AutoInvestBot:
             return
 
         if action == "BUY":
-            # Calcular costo propuesto
+            # #14 - Recalcular portfolio_value y cash AHORA (no del inicio del ciclo)
             portfolio_value = self.portfolio.calculate_total_value(self._current_prices)
+            cash_available = self.portfolio.cash
+
             proposed_cost = portfolio_value * (decision.portfolio_percent / 100)
 
-            # ATR para calibrar SL
+            # ATR para calibrar SL y position sizing
             atr_pct = 2.0
             ta = self._ta_cache.get(symbol, {})
             for sig in ta.get("signals", []):
                 if sig.get("name") == "ATR":
                     atr_pct = sig.get("value", 2.0)
+
+            # #10 - Volumen 24h para verificacion de liquidez
+            volume_24h = self._volumes_24h.get(symbol, 0)
 
             # Validar con risk manager
             assessment = self.risk_manager.evaluate(
@@ -310,20 +349,23 @@ class AutoInvestBot:
                 proposed_cost=proposed_cost,
                 current_price=current_price,
                 portfolio_value=portfolio_value,
-                cash_available=self.portfolio.cash,
+                cash_available=cash_available,
                 positions=self.portfolio.positions,
                 atr_percent=atr_pct,
+                volume_24h=volume_24h,
             )
 
             if not assessment.approved:
                 logger.warning(f"Risk Manager RECHAZO compra de {symbol}: {assessment.reason}")
                 for check in assessment.checks:
                     if not check.passed:
-                        logger.warning(f"  ❌ {check.rule}: {check.message}")
+                        logger.warning(f"  [RECHAZADO] {check.rule}: {check.message}")
                 return
 
             # Ejecutar compra
             cost = assessment.adjusted_cost
+            fees = assessment.suggested_fees
+
             trade = self.order_manager.execute_buy(
                 symbol=symbol,
                 cost_usdt=cost,
@@ -333,12 +375,15 @@ class AutoInvestBot:
             )
 
             if trade:
-                amount = cost / current_price
+                amount = trade.amount  # usar amount del trade real (con slippage)
+                actual_fees = trade.fees  # fees calculados por order_manager
+
                 self.portfolio.open_position(
                     symbol=symbol,
                     amount=amount,
-                    price=current_price,
-                    cost=cost,
+                    price=trade.price,  # precio con slippage
+                    cost=trade.cost,
+                    fees=actual_fees,  # #1 - fees se descuentan del cash
                     stop_loss=assessment.suggested_stop_loss,
                     take_profit=assessment.suggested_take_profit,
                 )
@@ -359,7 +404,7 @@ class AutoInvestBot:
             )
 
             if trade:
-                self.portfolio.close_position(symbol, current_price)
+                self.portfolio.close_position(symbol, trade.price)
 
     # ------------------------------------------------------------------
     # Loop principal
@@ -416,13 +461,21 @@ class AutoInvestBot:
             id="agent_decision",
             name="Decision del agente IA",
         )
+
+        # #5 - SL check mas frecuente: cada 15 segundos si hay posiciones
+        # APScheduler no soporta sub-minuto con "interval" en minutos,
+        # asi que usamos seconds directamente
+        sl_interval_seconds = settings.stoploss_check_interval * 60
+        if self.portfolio.positions:
+            sl_interval_seconds = min(sl_interval_seconds, 15)
         scheduler.add_job(
             self.task_check_stop_losses,
             "interval",
-            minutes=settings.stoploss_check_interval,
+            seconds=sl_interval_seconds,
             id="stop_loss_check",
             name="Verificar stop-loss",
         )
+
         scheduler.add_job(
             self.task_daily_report,
             "cron",
@@ -449,7 +502,8 @@ class AutoInvestBot:
         logger.info(f"   Analisis tecnico cada {settings.analysis_interval} min")
         logger.info(f"   Sentimiento cada {settings.sentiment_interval} min")
         logger.info(f"   Agente IA cada {settings.agent_interval} min")
-        logger.info(f"   Stop-loss check cada {settings.stoploss_check_interval} min")
+        logger.info(f"   Stop-loss check cada {sl_interval_seconds}s")
+        logger.info(f"   Trailing stop: {'ACTIVADO' if settings.trailing_stop_enabled else 'DESACTIVADO'}")
         logger.info(f"   Dashboard: http://{settings.dashboard_host}:{settings.dashboard_port}")
         logger.info("")
 
@@ -464,11 +518,42 @@ class AutoInvestBot:
         except (KeyboardInterrupt, SystemExit):
             pass
         finally:
-            logger.info("Apagando bot...")
-            update_dashboard_state("bot_running", False)
+            self._graceful_shutdown(scheduler, update_dashboard_state)
+
+    def _graceful_shutdown(self, scheduler, update_dashboard_state) -> None:
+        """
+        #7 - Apagado graceful: espera a que tareas en ejecucion terminen
+        antes de apagar el scheduler. Evita corrupcion de DB y orphaned orders.
+        """
+        logger.info("=" * 60)
+        logger.info("  Iniciando apagado graceful...")
+        logger.info("=" * 60)
+
+        # 1. Marcar bot como inactivo
+        update_dashboard_state("bot_running", False)
+
+        # 2. Guardar estado del portfolio
+        try:
             self.portfolio.save_snapshot(self._current_prices)
-            scheduler.shutdown(wait=False)
-            logger.info("AutoInvest Bot apagado correctamente.")
+            logger.info("Snapshot final guardado")
+        except Exception as exc:
+            logger.error(f"Error guardando snapshot final: {exc}")
+
+        # 3. Apagar scheduler esperando que terminen las tareas en curso
+        # wait=True permite que cualquier tarea en ejecucion (ej: un trade en CCXT)
+        # termine antes de cerrar, evitando orphaned orders y DB corrupta
+        try:
+            logger.info("Esperando que tareas del scheduler terminen...")
+            scheduler.shutdown(wait=True)
+            logger.info("Scheduler apagado correctamente")
+        except Exception as exc:
+            logger.error(f"Error apagando scheduler: {exc}")
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                pass
+
+        logger.info("AutoInvest Bot apagado correctamente.")
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +561,16 @@ class AutoInvestBot:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # #7 - Registrar signal handlers para cierre limpio
+    import signal as _signal
+
+    def _handle_signal(signum, frame):
+        logger.info(f"Senal recibida ({signum}). Iniciando cierre...")
+        raise SystemExit(0)
+
+    _signal.signal(_signal.SIGINT, _handle_signal)
+    _signal.signal(_signal.SIGTERM, _handle_signal)
+
     bot = AutoInvestBot()
     bot.run()
 

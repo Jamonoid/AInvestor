@@ -55,13 +55,27 @@ class OrderManager:
             logger.error(f"Precio invalido para {symbol}: {current_price}")
             return None
 
-        amount = cost_usdt / current_price  # cantidad de crypto a comprar
-        fees = cost_usdt * 0.001  # 0.1% fee estimado de Binance
-
         if self.mode == "paper":
-            return self._paper_trade(symbol, "buy", current_price, amount, cost_usdt, fees, reason, confidence)
+            # #2 - Slippage simulado: compras ejecutan a precio ligeramente mayor
+            slippage_pct = settings.simulated_slippage_percent / 100
+            exec_price = current_price * (1 + slippage_pct)
+
+            # #1 - Fees simulados
+            fees_pct = settings.simulated_fees_percent / 100
+            fees = cost_usdt * fees_pct
+
+            # Cantidad efectiva de crypto (despues de fees y slippage)
+            effective_cost = cost_usdt  # lo que se descuenta del cash (sin fees, fees se descuentan aparte)
+            amount = effective_cost / exec_price
+
+            return self._paper_trade(
+                symbol, "buy", exec_price, amount, effective_cost, fees, reason, confidence,
+            )
         else:
-            return self._live_trade(symbol, "buy", current_price, amount, cost_usdt, reason, confidence)
+            amount = cost_usdt / current_price
+            return self._live_trade(
+                symbol, "buy", current_price, amount, cost_usdt, reason, confidence,
+            )
 
     def execute_sell(
         self,
@@ -87,14 +101,26 @@ class OrderManager:
             logger.error(f"Parametros invalidos para venta de {symbol}")
             return None
 
-        cost = amount * current_price
-        fees = cost * 0.001
-        pnl = (current_price - entry_price) * amount if entry_price > 0 else 0
-
         if self.mode == "paper":
-            return self._paper_trade(symbol, "sell", current_price, amount, cost, fees, reason, confidence, pnl)
+            # #2 - Slippage simulado: ventas ejecutan a precio ligeramente menor
+            slippage_pct = settings.simulated_slippage_percent / 100
+            exec_price = current_price * (1 - slippage_pct)
+
+            # #1 - Fees simulados
+            cost = amount * exec_price
+            fees = cost * (settings.simulated_fees_percent / 100)
+
+            # PnL incluyendo fees y slippage
+            pnl = (exec_price - entry_price) * amount - fees if entry_price > 0 else 0
+
+            return self._paper_trade(
+                symbol, "sell", exec_price, amount, cost, fees, reason, confidence, pnl,
+            )
         else:
-            return self._live_trade(symbol, "sell", current_price, amount, cost, reason, confidence)
+            cost = amount * current_price
+            return self._live_trade(
+                symbol, "sell", current_price, amount, cost, reason, confidence,
+            )
 
     # ------------------------------------------------------------------
     # Paper trading
@@ -135,11 +161,12 @@ class OrderManager:
             session.commit()
             session.refresh(trade)
 
-            emoji = "🟢" if side == "buy" else "🔴"
+            side_label = "COMPRA" if side == "buy" else "VENTA"
             logger.info(
-                f"{emoji} PAPER {side.upper()} {symbol}: "
+                f"PAPER {side_label} {symbol}: "
                 f"{amount:.6f} @ ${price:.2f} = ${cost:.2f} "
-                f"{'(PnL: $' + f'{pnl:.2f})' if pnl != 0 else ''}"
+                f"(fees: ${fees:.2f})"
+                f"{'  PnL: $' + f'{pnl:.2f}' if pnl != 0 else ''}"
             )
             return trade
         except Exception as exc:
@@ -162,6 +189,7 @@ class OrderManager:
         cost: float,
         reason: str,
         confidence: float,
+        order_type: str = "market",
     ) -> Trade | None:
         """Ejecuta un trade real en Binance via CCXT."""
         if not self.exchange:
@@ -169,18 +197,43 @@ class OrderManager:
             return None
 
         try:
-            if side == "buy":
+            # #13 - Soporte para limit orders
+            if order_type == "limit" and side == "buy":
+                limit_price = price * 1.001
+                order = self.exchange.create_limit_buy_order(symbol, amount, limit_price)
+                logger.info(f"Limit buy order enviada: {symbol} x{amount:.6f} @ ${limit_price:.2f}")
+            elif order_type == "limit" and side == "sell":
+                limit_price = price * 0.999
+                order = self.exchange.create_limit_sell_order(symbol, amount, limit_price)
+                logger.info(f"Limit sell order enviada: {symbol} x{amount:.6f} @ ${limit_price:.2f}")
+            elif side == "buy":
                 order = self.exchange.create_market_buy_order(symbol, amount)
             else:
                 order = self.exchange.create_market_sell_order(symbol, amount)
 
+            # #3 - Para limit orders: esperar a que se llene
+            if order_type == "limit":
+                order = self._wait_for_fill(symbol, order, max_wait_seconds=30)
+                if order is None:
+                    return None  # orden cancelada o timeout
+
             # Extraer datos de la orden ejecutada
-            filled_price = order.get("average", price)
-            filled_amount = order.get("filled", amount)
-            filled_cost = order.get("cost", cost)
+            filled_amount = order.get("filled", 0) or 0
+            filled_price = order.get("average", price) or price
+            filled_cost = order.get("cost", 0) or 0
+
+            # #3 - Validar que la orden se lleno antes de crear posicion
+            if filled_amount <= 0:
+                logger.warning(
+                    f"Orden {side} {symbol} no se lleno (filled=0). "
+                    f"Status: {order.get('status', 'unknown')}. NO se creara posicion."
+                )
+                return None
             fees_total = 0.0
             if order.get("fees"):
                 fees_total = sum(f.get("cost", 0) for f in order["fees"])
+            elif order.get("fee"):
+                fees_total = order["fee"].get("cost", 0)
 
             trade = Trade(
                 timestamp=_dt.datetime.utcnow(),
@@ -189,7 +242,7 @@ class OrderManager:
                 price=filled_price,
                 amount=filled_amount,
                 cost=filled_cost,
-                order_type="market",
+                order_type=order_type,
                 is_paper=False,
                 reason=reason,
                 confidence=confidence,
@@ -204,7 +257,8 @@ class OrderManager:
                 session.refresh(trade)
                 logger.info(
                     f"LIVE {side.upper()} {symbol}: "
-                    f"{filled_amount:.6f} @ ${filled_price:.2f} = ${filled_cost:.2f}"
+                    f"{filled_amount:.6f} @ ${filled_price:.2f} = ${filled_cost:.2f} "
+                    f"(fees: ${fees_total:.4f})"
                 )
                 return trade
             except Exception as exc:
@@ -217,6 +271,67 @@ class OrderManager:
         except Exception as exc:
             logger.error(f"Error ejecutando orden LIVE {side} {symbol}: {exc}")
             return None
+
+    def _wait_for_fill(
+        self,
+        symbol: str,
+        order: dict,
+        max_wait_seconds: int = 30,
+        poll_interval: float = 2.0,
+    ) -> dict | None:
+        """
+        #3 - Espera activamente a que una limit order se llene.
+
+        Args:
+            symbol: Par de trading
+            order: Orden retornada por CCXT
+            max_wait_seconds: Tiempo maximo de espera
+            poll_interval: Intervalo de polling en segundos
+
+        Returns:
+            Orden actualizada si se lleno, None si timeout/error
+        """
+        import time as _time
+
+        order_id = order.get("id")
+        if not order_id:
+            logger.error("Orden sin ID, no se puede rastrear")
+            return None
+
+        elapsed = 0.0
+        while elapsed < max_wait_seconds:
+            try:
+                updated = self.exchange.fetch_order(order_id, symbol)
+                status = updated.get("status", "open")
+                filled = updated.get("filled", 0) or 0
+
+                if status == "closed" or filled > 0:
+                    logger.info(
+                        f"Limit order llenada: {symbol} filled={filled:.6f} "
+                        f"@ avg=${updated.get('average', 0):.2f}"
+                    )
+                    return updated
+                elif status == "canceled" or status == "cancelled":
+                    logger.warning(f"Limit order cancelada externamente: {symbol}")
+                    return None
+
+                _time.sleep(poll_interval)
+                elapsed += poll_interval
+
+            except Exception as exc:
+                logger.error(f"Error verificando limit order {symbol}: {exc}")
+                _time.sleep(poll_interval)
+                elapsed += poll_interval
+
+        # Timeout: cancelar la orden
+        logger.warning(f"Timeout esperando limit order {symbol} ({max_wait_seconds}s). Cancelando...")
+        try:
+            self.exchange.cancel_order(order_id, symbol)
+            logger.info(f"Limit order cancelada: {symbol} #{order_id}")
+        except Exception as exc:
+            logger.error(f"Error cancelando limit order {symbol}: {exc}")
+
+        return None
 
     # ------------------------------------------------------------------
     # Consultas
@@ -246,6 +361,7 @@ class OrderManager:
                     "confidence": t.confidence,
                     "pnl": t.pnl,
                     "status": t.status,
+                    "fees": t.fees,
                 }
                 for t in trades
             ]
